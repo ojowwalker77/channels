@@ -1,4 +1,4 @@
-// The daemon's socket verbs (src/daemon.ts): hello names the version, the computer key and its
+// The daemon's socket verbs (src/daemon/server.ts): hello names the version, the computer key and its
 // pairing; adopt stores the cert; listening names the subscribers; stop quiets the socket.
 
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";

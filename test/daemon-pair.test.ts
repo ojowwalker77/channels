@@ -1,4 +1,4 @@
-// kiwi pair (src/daemon.ts): the computer writes its signed ask to slot a of the relay's
+// kiwi pair (src/daemon/pair.ts): the computer writes its signed ask to slot a of the relay's
 // pairing mailbox, waits on slot b, checks the cert is for this computer, keeps it in
 // machine.json and deletes the mailbox. Against a real relay (startRelay).
 

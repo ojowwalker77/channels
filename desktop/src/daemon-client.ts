@@ -1,4 +1,4 @@
-// Talking to "kiwi daemon" over its local socket, in the daemon's own protocol (src/daemon.ts is
+// Talking to "kiwi daemon" over its local socket, in the daemon's own protocol (src/daemon/protocol.ts is
 // the contract; this follows it, so the CLI and the app reach the same daemon the same way):
 //   path: $KIWI_HOME/daemon.sock (a named pipe on Windows: \\.\pipe\kiwi-daemon-<home's tag>)
 //   framing: newline-delimited JSON, one request per line, one response per line
@@ -34,7 +34,7 @@ export function kiwiHome(): string {
 }
 
 export function daemonSocketPath(home: string = kiwiHome()): string {
-  // The same name the daemon picks (src/daemon.ts daemonSock): its home, as a tag.
+  // The same name the daemon picks (src/daemon/protocol.ts daemonSock): its home, as a tag.
   if (process.platform === "win32") return `\\\\.\\pipe\\kiwi-daemon-${home.replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(-64) || "kiwi"}`;
   return path.join(home, "daemon.sock");
 }
@@ -108,7 +108,7 @@ export async function daemonAdopt(home: string, params: AdoptParams, timeoutMs =
 
 /**
  * Start `kiwi daemon` for `home`, apart from the app (it outlives a quit). It gets the app's relay:
- * a daemon not yet adopted follows the relay it starts on (src/daemon.ts ensureMachine), and the
+ * a daemon not yet adopted follows the relay it starts on (src/daemon/pair.ts ensureMachine), and the
  * app's own environment rarely says one (KIWI_RELAY), so without it a self-hosted relay's app
  * would adopt a daemon on the public one.
  */

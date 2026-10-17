@@ -1,4 +1,4 @@
-// The daemon multiplexes one relay stream per agent seat (src/daemon.ts): every subscriber of
+// The daemon multiplexes one relay stream per agent seat (src/daemon/server.ts): every subscriber of
 // an agent shares its seat's stream, each from its own cursor; a restart only needs the cursors.
 // Against a real relay (startRelay), with the seat's home written the way a join would.
 

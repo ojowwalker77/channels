@@ -1,4 +1,4 @@
-// This computer's key (machine.json). `kiwi pair` adds its person's cert (src/daemon.ts), and
+// This computer's key (machine.json). `kiwi pair` adds its person's cert (src/daemon/pair.ts), and
 // agents started here then carry a computer claim in their join requests (computerClaimFor).
 
 import { existsSync, readFileSync } from "node:fs";
