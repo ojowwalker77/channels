@@ -75,7 +75,10 @@ export function markMoves(files: FileChange[]): number {
   const left: Record<Side, Map<string, number>> = { removed: new Map(), added: new Map() }
   for (const [k, list] of where.removed) {
     const n = Math.min(list.length, where.added.get(k)?.length ?? 0)
-    if (n) left.removed.set(k, n), left.added.set(k, n)
+    if (n) {
+      left.removed.set(k, n)
+      left.added.set(k, n)
+    }
   }
   if (!left.removed.size) return 0
   let total = 0
