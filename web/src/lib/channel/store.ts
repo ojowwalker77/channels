@@ -10,10 +10,6 @@ export function changed(): void {
   window.dispatchEvent(new Event(CHANGED))
 }
 
-export function parseHash(hash: string): { code: string } {
-  return { code: decodeURIComponent(hash.replace(/^#/, "")).trim() }
-}
-
 export function isJoinCode(code: string): boolean {
   try {
     decodeJoinCode(code)
