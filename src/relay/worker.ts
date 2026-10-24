@@ -41,7 +41,20 @@ import {
   type SqlParam,
 } from "./room.ts";
 import { corsPreflight, onMailboxHttp, sqlMailboxStore, withCors } from "./mailbox.ts";
-import { MACHINE_ASKS_PER_MINUTE, MACHINE_BOX_TTL_MS, MACHINE_UNSEEN_MS, machineAlarmAt, onMachineHttp, signedMachineRequest, type MachineBox, type MachineStore } from "./machine.ts";
+import {
+  MACHINE_ASKS_PER_MINUTE,
+  MACHINE_BOX_TTL_MS,
+  MACHINE_UNSEEN_MS,
+  machineAlarmAt,
+  onMachineHttp,
+  onPersonHttp,
+  personMachine,
+  signedMachineRequest,
+  signedPersonRequest,
+  type MachineBox,
+  type MachineStore,
+  type PersonMachine,
+} from "./machine.ts";
 import { allow as allowPerMinute } from "./room/limits.ts";
 import { makeRelay, onHttp, runRoom, runRoomSync, type Relay } from "./route.ts";
 import { GithubApp, githubAppFrom, GithubPush, githubPushFrom } from "./github-app.ts";
@@ -55,6 +68,7 @@ interface Env {
   MAILBOX: DurableObjectNamespace<MailboxBox>;
   /** One per paired computer: who may ask it to act, its sealed asks, and its live socket. */
   MACHINES: DurableObjectNamespace<MachineInbox>;
+  PERSON_MACHINES: DurableObjectNamespace<PersonMachines>;
   /** When set, channels belong to humans signed in with this WorkOS AuthKit client. */
   WORKOS_CLIENT_ID?: string;
   /** The AuthKit domain (https://….authkit.app or a custom one), whose keys may also sign tokens. Comma-separated while moving domains. */
@@ -320,6 +334,8 @@ export class MachineInbox extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS binding (k INTEGER PRIMARY KEY CHECK (k = 1), person TEXT NOT NULL, mxpk TEXT NOT NULL, cert_at INTEGER NOT NULL, seen_at INTEGER NOT NULL)");
+    const columns = ctx.storage.sql.exec("PRAGMA table_info(binding)").toArray();
+    if (!columns.some((c) => c.name === "label")) ctx.storage.sql.exec("ALTER TABLE binding ADD COLUMN label TEXT NOT NULL DEFAULT ''");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS floor (k INTEGER PRIMARY KEY CHECK (k = 1), cert_at INTEGER NOT NULL)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS boxes (id TEXT PRIMARY KEY, box TEXT NOT NULL, at INTEGER NOT NULL)");
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(PING, PONG));
@@ -339,18 +355,19 @@ export class MachineInbox extends DurableObject<Env> {
     else if (set === null || at < set) await this.ctx.storage.setAlarm(at);
   }
 
-  override async fetch(req: Request): Promise<Response> {
+  private store(): MachineStore {
     const sql = this.ctx.storage.sql;
-    const store: MachineStore = {
+    return {
       binding: async () => {
-        const row = sql.exec("SELECT person, mxpk, cert_at, seen_at FROM binding").toArray()[0] as { person: string; mxpk: string; cert_at: number; seen_at: number } | undefined;
-        return row ? { person: row.person, mxpk: row.mxpk, certAt: row.cert_at, seenAt: row.seen_at } : null;
+        const row = sql.exec("SELECT person, mxpk, label, cert_at, seen_at FROM binding").toArray()[0] as { person: string; mxpk: string; label: string; cert_at: number; seen_at: number } | undefined;
+        return row ? { person: row.person, mxpk: row.mxpk, label: row.label, certAt: row.cert_at, seenAt: row.seen_at } : null;
       },
       floor: async () => (sql.exec("SELECT cert_at FROM floor").toArray()[0] as { cert_at: number } | undefined)?.cert_at ?? 0,
-      bind: async (_mpk, b) => {
-        sql.exec("INSERT OR REPLACE INTO binding (k, person, mxpk, cert_at, seen_at) VALUES (1, ?, ?, ?, ?)", b.person, b.mxpk, b.certAt, b.seenAt);
+      bind: async (mpk, b) => {
+        sql.exec("INSERT OR REPLACE INTO binding (k, person, mxpk, label, cert_at, seen_at) VALUES (1, ?, ?, ?, ?, ?)", b.person, b.mxpk, b.label, b.certAt, b.seenAt);
         sql.exec("INSERT INTO floor (k, cert_at) VALUES (1, ?) ON CONFLICT (k) DO UPDATE SET cert_at = MAX(cert_at, excluded.cert_at)", b.certAt);
         await this.schedule();
+        await this.env.PERSON_MACHINES.get(this.env.PERSON_MACHINES.idFromName(b.person)).add(mpk);
       },
       seen: async (_mpk, at) => {
         sql.exec("UPDATE binding SET seen_at = ?", at);
@@ -379,6 +396,16 @@ export class MachineInbox extends DurableObject<Env> {
         for (const ws of this.live()) close(ws, 4000, "unpaired");
       },
     };
+  }
+
+  async listed(mpk: string): Promise<{ person: string; machine: PersonMachine } | null> {
+    const store = this.store();
+    const b = await store.binding(mpk);
+    return b ? { person: b.person, machine: personMachine(mpk, b, store.online(mpk)) } : null;
+  }
+
+  override async fetch(req: Request): Promise<Response> {
+    const store = this.store();
     try {
       const out = await onMachineHttp(req, store, { perMachine: (key) => allowPerMinute(key, MACHINE_ASKS_PER_MINUTE) });
       if (out instanceof Response) return out;
@@ -394,8 +421,11 @@ export class MachineInbox extends DurableObject<Env> {
     }
   }
 
-  override webSocketClose(ws: WebSocket, code: number): void {
+  override async webSocketClose(ws: WebSocket, code: number): Promise<void> {
     close(ws, code === 1005 ? 1000 : code, "");
+    if (this.live().some((x) => x !== ws)) return;
+    this.ctx.storage.sql.exec("UPDATE binding SET seen_at = ?", Date.now());
+    await this.schedule();
   }
 
   override async alarm(): Promise<void> {
@@ -404,6 +434,36 @@ export class MachineInbox extends DurableObject<Env> {
     sql.exec("DELETE FROM boxes WHERE at < ?", now - MACHINE_BOX_TTL_MS);
     if (!this.live().length) sql.exec("DELETE FROM binding WHERE seen_at < ?", now - MACHINE_UNSEEN_MS);
     await this.schedule();
+  }
+}
+
+export class PersonMachines extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS machines (mpk TEXT PRIMARY KEY)");
+  }
+
+  async add(mpk: string): Promise<void> {
+    this.ctx.storage.sql.exec("INSERT OR IGNORE INTO machines (mpk) VALUES (?)", mpk);
+  }
+
+  private async machines(person: string): Promise<PersonMachine[]> {
+    const sql = this.ctx.storage.sql;
+    const keys = sql
+      .exec("SELECT mpk FROM machines")
+      .toArray()
+      .map((r) => String(r.mpk));
+    const listed = await Promise.all(keys.map(async (mpk) => ({ mpk, got: await this.env.MACHINES.get(this.env.MACHINES.idFromName(mpk)).listed(mpk) })));
+    for (const { mpk, got } of listed) if (got?.person !== person) sql.exec("DELETE FROM machines WHERE mpk = ?", mpk);
+    return listed.flatMap(({ got }) => (got?.person === person ? [got.machine] : []));
+  }
+
+  override async fetch(req: Request): Promise<Response> {
+    try {
+      return (await onPersonHttp(req, { machines: (person) => this.machines(person) })) ?? withCors(errorResponse(new NotFound({ message: "not found" })));
+    } catch (err) {
+      return withCors(errorResponse(err));
+    }
   }
 }
 
@@ -481,6 +541,12 @@ export default {
       if (!signed) return withCors(errorResponse(new NotFound({ message: "not found" })));
       if (signed instanceof Response) return signed;
       return env.MACHINES.get(env.MACHINES.idFromName(signed.mpk)).fetch(req);
+    }
+    if (url.pathname.startsWith("/v1/person/")) {
+      const pk = await signedPersonRequest(req, Date.now());
+      if (pk === null) return withCors(errorResponse(new NotFound({ message: "not found" })));
+      if (pk instanceof Response) return pk;
+      return env.PERSON_MACHINES.get(env.PERSON_MACHINES.idFromName(pk)).fetch(req);
     }
     const github = await onGithubHttp(req, env.GITHUB_WEBHOOK_SECRET, githubRoutes(env));
     if (github) return github;

@@ -13,7 +13,8 @@
       { "name": "OWNERS", "class_name": "Owners" },
       { "name": "MAILBOX", "class_name": "MailboxBox" },
       { "name": "REPOS", "class_name": "Repos" },
-      { "name": "MACHINES", "class_name": "MachineInbox" }
+      { "name": "MACHINES", "class_name": "MachineInbox" },
+      { "name": "PERSON_MACHINES", "class_name": "PersonMachines" }
     ]
   },
   // SQLite-backed Durable Objects are the ones available on the Workers Free plan.
@@ -30,7 +31,8 @@
     { "tag": "v7", "new_sqlite_classes": ["Owners"] },
     { "tag": "v8", "new_sqlite_classes": ["Repos"] },
     // New agent v2: one object per paired computer, holding its person, sealed asks and socket.
-    { "tag": "v9", "new_sqlite_classes": ["MachineInbox"] }
+    { "tag": "v9", "new_sqlite_classes": ["MachineInbox"] },
+    { "tag": "v10", "new_sqlite_classes": ["PersonMachines"] }
   ],
   // The public site (site/): landing page, invite links, install scripts.
   // Static assets are free and don't count as Worker requests.

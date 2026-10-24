@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +9,7 @@ import { ASK_MAX_BYTES } from "@kiwi/core/machine-ask.ts";
 import { certifyMachine } from "@kiwi/core/person.ts";
 import { WS_PROTOCOL } from "@kiwi/core/protocol.ts";
 import { startRelay } from "../src/relay/bun.ts";
-import { MACHINE_BOX_TTL_MS, MACHINE_UNSEEN_MS, machineAlarmAt, machineScope } from "../src/relay/machine.ts";
+import { MACHINE_BOX_TTL_MS, MACHINE_UNSEEN_MS, machineAlarmAt, machineScope, personScope, type PersonMachine } from "../src/relay/machine.ts";
 
 setDefaultTimeout(30_000);
 
@@ -47,9 +48,9 @@ async function call(id: Identity, m: Identity, method: string, path: string, bod
   return fetch(relay + path, { method, headers: { authorization: `Bearer ${auth}`, ...(text ? { "content-type": "application/json" } : {}) }, ...(text ? { body: text } : {}) });
 }
 
-async function registered(label: string): Promise<Identity> {
+async function registered(label: string, owner: Identity = person): Promise<Identity> {
   const m = await withExchangeKey(await generateIdentity(label));
-  const cert = await certifyMachine(person, { pk: m.pk, xpk: m.xpk!, label });
+  const cert = await certifyMachine(owner, { pk: m.pk, xpk: m.xpk!, label });
   expect((await call(m, m, "PUT", base(m), { cert })).status).toBe(204);
   return m;
 }
@@ -196,6 +197,98 @@ describe("unpairing", () => {
     expect((await call(m, m, "DELETE", base(m))).status).toBe(204);
     expect(await inbox.closed).toBe(4000);
     expect((await call(person, m, "POST", `${base(m)}/inbox`, { box: "a.b.c" })).status).toBe(403);
+  });
+});
+
+async function computers(as: Identity, of: Identity = as, at = relay): Promise<Response> {
+  const path = `/v1/person/${of.pk}/machines`;
+  return fetch(at + path, { headers: { authorization: `Bearer ${await signRequest(as, personScope(of.pk), "GET", path)}` } });
+}
+
+async function listed(p: Identity, at = relay): Promise<PersonMachine[]> {
+  const res = await computers(p, p, at);
+  expect(res.status).toBe(200);
+  return ((await res.json()) as { machines: PersonMachine[] }).machines;
+}
+
+describe("a person's paired computers", () => {
+  test("lists only their own, by label, with each one's keys, label, and whether it's online", async () => {
+    const me = await withExchangeKey(await generateIdentity("me"));
+    const studio = await registered("studio", me);
+    const attic = await registered("attic", me);
+    await registered("theirs", stranger);
+    expect(await listed(me)).toEqual([
+      { key: attic.pk, xpk: attic.xpk!, label: "attic", online: false, seenAt: t },
+      { key: studio.pk, xpk: studio.xpk!, label: "studio", online: false, seenAt: t },
+    ]);
+    const inbox = await openInbox(studio, studio);
+    expect((await listed(me))[1]).toEqual({ key: studio.pk, xpk: studio.xpk!, label: "studio", online: true, since: t, seenAt: t });
+    inbox.ws.close();
+    await inbox.closed;
+  });
+
+  test("offline once its socket closes, last seen when it closed", async () => {
+    const me = await withExchangeKey(await generateIdentity("me"));
+    const laptop = await registered("laptop", me);
+    const inbox = await openInbox(laptop, laptop);
+    const opened = t;
+    t += 60_000;
+    inbox.ws.close();
+    await inbox.closed;
+    await until("offline", async () => !(await listed(me))[0]!.online);
+    expect((await listed(me))[0]).toEqual({ key: laptop.pk, xpk: laptop.xpk!, label: "laptop", online: false, seenAt: opened + 60_000 });
+  });
+
+  test("only the person may list them, signed for this path", async () => {
+    const me = await withExchangeKey(await generateIdentity("me"));
+    await registered("private", me);
+    const path = `/v1/person/${me.pk}/machines`;
+    expect((await fetch(relay + path)).status).toBe(401);
+    expect((await computers(stranger, me)).status).toBe(403);
+    const machineToken = await signRequest(me, machineScope(me.pk), "GET", path);
+    expect((await fetch(relay + path, { headers: { authorization: `Bearer ${machineToken}` } })).status).toBe(401);
+    const otherPath = await signRequest(me, personScope(me.pk), "GET", `/v1/machine/${me.pk}`);
+    expect((await fetch(relay + path, { headers: { authorization: `Bearer ${otherPath}` } })).status).toBe(401);
+    const good = await signRequest(me, personScope(me.pk), "GET", path);
+    expect((await fetch(relay + path, { method: "POST", headers: { authorization: `Bearer ${good}` } })).status).toBe(404);
+  });
+
+  test("an unpaired computer drops off, and one paired to someone else moves to their list", async () => {
+    const me = await withExchangeKey(await generateIdentity("me"));
+    const them = await withExchangeKey(await generateIdentity("them"));
+    const kept = await registered("kept", me);
+    const moving = await registered("moving", me);
+    expect((await listed(me)).map((m) => m.label)).toEqual(["kept", "moving"]);
+    expect((await call(me, moving, "DELETE", base(moving))).status).toBe(204);
+    expect((await listed(me)).map((m) => m.key)).toEqual([kept.pk]);
+    const cert = await certifyMachine(them, { pk: moving.pk, xpk: moving.xpk!, label: "theirs now" }, Date.now() + 1_000);
+    expect((await call(moving, moving, "PUT", base(moving), { cert })).status).toBe(204);
+    expect((await listed(them)).map((m) => [m.key, m.label])).toEqual([[moving.pk, "theirs now"]]);
+    expect((await listed(me)).map((m) => m.key)).toEqual([kept.pk]);
+  });
+
+  test("a relay from before labels keeps its paired computers, unlabelled until each registers again", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "kiwi-machine-relay-old-"));
+    const me = await withExchangeKey(await generateIdentity("me"));
+    const old = await withExchangeKey(await generateIdentity("old"));
+    const db = new Database(join(dir, "people.sqlite"), { create: true });
+    db.run("CREATE TABLE machines (mpk TEXT PRIMARY KEY, person TEXT NOT NULL, mxpk TEXT NOT NULL, cert_at INTEGER NOT NULL, seen_at INTEGER NOT NULL)");
+    db.query("INSERT INTO machines (mpk, person, mxpk, cert_at, seen_at) VALUES (?, ?, ?, ?, ?)").run(old.pk, me.pk, old.xpk!, t - 5_000, t - 5_000);
+    db.close();
+    const upgraded = startRelay({ port: 0, hostname: "127.0.0.1", dataDir: dir, now: () => t });
+    try {
+      const at = upgraded.url.origin;
+      expect(await listed(me, at)).toEqual([{ key: old.pk, xpk: old.xpk!, label: "", online: false, seenAt: t - 5_000 }]);
+      const cert = await certifyMachine(me, { pk: old.pk, xpk: old.xpk!, label: "old mac" }, t);
+      const path = base(old);
+      const text = JSON.stringify({ cert });
+      const put = await fetch(at + path, { method: "PUT", headers: { authorization: `Bearer ${await token(old, old, "PUT", path, text)}`, "content-type": "application/json" }, body: text });
+      expect(put.status).toBe(204);
+      expect((await listed(me, at)).map((m) => m.label)).toEqual(["old mac"]);
+    } finally {
+      upgraded.stop(true);
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

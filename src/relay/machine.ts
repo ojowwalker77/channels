@@ -16,9 +16,10 @@ const MACHINE_PENDING_MAX = 20;
 const REGISTER_MAX_BYTES = 8_192;
 const INBOX_MAX_BYTES = ASK_MAX_BYTES + 256;
 
-interface MachineBinding {
+export interface MachineBinding {
   person: string;
   mxpk: string;
+  label: string;
   certAt: number;
   seenAt: number;
 }
@@ -44,11 +45,32 @@ export interface MachineStore {
   close(mpk: string): void;
 }
 
+export interface PersonMachine {
+  key: string;
+  xpk: string;
+  label: string;
+  online: boolean;
+  since?: number;
+  seenAt: number;
+}
+
+export interface PersonMachinesStore {
+  machines(person: string): Promise<PersonMachine[]>;
+}
+
 export type MachineOutcome = Response | { upgrade: string } | null;
 
 const PATH = /^\/v1\/machine\/([A-Za-z0-9_-]{43})(?:\/(inbox|ws)(?:\/([A-Za-z0-9_-]{22}))?)?$/;
 
+const PERSON_PATH = /^\/v1\/person\/([A-Za-z0-9_-]{43})\/machines$/;
+
 export const machineScope = (mpk: string): string => `machine:${mpk}`;
+
+export const personScope = (pk: string): string => `person:${pk}`;
+
+export function personMachine(mpk: string, b: MachineBinding, online: number | null): PersonMachine {
+  return { key: mpk, xpk: b.mxpk, label: b.label, online: online !== null, ...(online === null ? {} : { since: online }), seenAt: b.seenAt };
+}
 
 const refuse = (err: unknown): Response => withCors(errorResponse(err));
 const answer = (data: unknown, status = 200): Response => withCors(Response.json(data, { status }));
@@ -116,7 +138,7 @@ export async function onMachineHttp(
     if (!cert || cert.machine !== mpk) return refuse(new BadRequest({ message: "a machine registers with its own cert" }));
     const floor = await store.floor(mpk);
     if (bound ? cert.at < bound.certAt : floor > 0 && cert.at <= floor) return refuse(new Conflict({ message: "a newer cert was registered for this machine" }));
-    await store.bind(mpk, { person: cert.pk, mxpk: cert.mxpk, certAt: cert.at, seenAt: now });
+    await store.bind(mpk, { person: cert.pk, mxpk: cert.mxpk, label: cert.label, certAt: cert.at, seenAt: now });
     return done();
   }
   if (!sub && req.method === "DELETE") {
@@ -157,4 +179,26 @@ export async function onMachineHttp(
     return { upgrade: mpk };
   }
   return refuse(new NotFound({ message: "not found" }));
+}
+
+export async function signedPersonRequest(req: Request, now: number): Promise<string | Response | null> {
+  const url = new URL(req.url);
+  const m = PERSON_PATH.exec(url.pathname);
+  if (!m) return null;
+  const pk = m[1]!;
+  if (req.method !== "GET") return refuse(new NotFound({ message: "not found" }));
+  const token = requestToken(req);
+  const signer = token ? await verifyRequest(token, personScope(pk), "GET", url.pathname, "", now) : null;
+  if (!signer) return refuse(new Unauthorized({ message: "sign this request for this person and path" }));
+  if (signer !== pk) return refuse(new Forbidden({ message: "only the person lists their own computers" }));
+  return pk;
+}
+
+export async function onPersonHttp(req: Request, store: PersonMachinesStore, opts: { now?: () => number } = {}): Promise<Response | null> {
+  if (!PERSON_PATH.test(new URL(req.url).pathname)) return null;
+  if (req.method === "OPTIONS") return corsPreflight();
+  const pk = await signedPersonRequest(req, (opts.now ?? Date.now)());
+  if (pk === null || pk instanceof Response) return pk;
+  const machines = await store.machines(pk);
+  return answer({ machines: machines.sort((a, b) => a.label.localeCompare(b.label) || a.key.localeCompare(b.key)) });
 }
